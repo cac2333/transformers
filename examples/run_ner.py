@@ -481,7 +481,7 @@ def main():
         torch.save(args, os.path.join(args.output_dir, "training_args.bin"))
     
     if args.save_loss:
-        with open(os.path.join(args.loss_dir, str(args.learning_rate)), 'wb') as fp:
+        with open(os.path.join(args.loss_dir, str(args.learning_rate)+'.p'), 'wb') as fp:
             pickle.dump(acc_loss, fp)
     # Evaluation
     results = {}
