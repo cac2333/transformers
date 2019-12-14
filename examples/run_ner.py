@@ -24,14 +24,17 @@ import os
 import random
 
 import numpy as np
+import pickle
 import torch
 from seqeval.metrics import precision_score, recall_score, f1_score
 from tensorboardX import SummaryWriter
 from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
-from tqdm import tqdm, trange
-from bert_ner import convert_examples_to_features, get_labels, read_examples_from_file
+from tqdm import trange 
+from tqdm import tqdm
+from bert_ner import convert_examples_to_features
+from bert_ner import ner_processors as processors
 
 from transformers import AdamW, get_linear_schedule_with_warmup
 from transformers import WEIGHTS_NAME, BertConfig, BertForTokenClassification, BertTokenizer
@@ -61,7 +64,7 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-def train(args, train_dataset, model, tokenizer, labels, pad_token_label_id):
+def train(args, train_dataset, model, tokenizer, labels, pad_token_label_id, acc_loss):
     """ Train the model """
     if args.local_rank in [-1, 0]:
         tb_writer = SummaryWriter()
@@ -144,6 +147,10 @@ def train(args, train_dataset, model, tokenizer, labels, pad_token_label_id):
                 loss.backward()
 
             tr_loss += loss.item()
+
+            if global_step>0:
+                acc_loss.append(tr_loss/global_step)
+
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
@@ -265,6 +272,7 @@ def load_and_cache_examples(args, tokenizer, labels, pad_token_label_id, mode):
     if args.local_rank not in [-1, 0] and not evaluate:
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
+    processor=processors[args.task_name]()
     # Load data features from cache or dataset file
     cached_features_file = os.path.join(args.data_dir, "cached_{}_{}_{}".format(mode,
         list(filter(None, args.model_name_or_path.split("/"))).pop(),
@@ -274,21 +282,10 @@ def load_and_cache_examples(args, tokenizer, labels, pad_token_label_id, mode):
         features = torch.load(cached_features_file)
     else:
         logger.info("Creating features from dataset file at %s", args.data_dir)
-        examples = read_examples_from_file(args.data_dir, mode)
-        features = convert_examples_to_features(examples, labels, args.max_seq_length, tokenizer,
-                                                cls_token_at_end=bool(args.model_type in ["xlnet"]),
-                                                # xlnet has a cls token at the end
-                                                cls_token=tokenizer.cls_token,
-                                                cls_token_segment_id=2 if args.model_type in ["xlnet"] else 0,
-                                                sep_token=tokenizer.sep_token,
-                                                sep_token_extra=bool(args.model_type in ["roberta"]),
-                                                # roberta uses an extra separator b/w pairs of sentences, cf. github.com/pytorch/fairseq/commit/1684e166e3da03f5b600dbb7855cb98ddfcd0805
-                                                pad_on_left=bool(args.model_type in ["xlnet"]),
-                                                # pad on the left for xlnet
-                                                pad_token=tokenizer.convert_tokens_to_ids([tokenizer.pad_token])[0],
-                                                pad_token_segment_id=4 if args.model_type in ["xlnet"] else 0,
-                                                pad_token_label_id=pad_token_label_id
-                                                )
+        examples=processor.get_train_examples(args.data_dir) if mode=='train' else processor.get_dev_examples(args.data_dir)
+        features = convert_examples_to_features(examples, labels, args.max_seq_length, tokenizer)
+
+                                                
         if args.local_rank in [-1, 0]:
             logger.info("Saving features into cached file %s", cached_features_file)
             torch.save(features, cached_features_file)
@@ -300,7 +297,7 @@ def load_and_cache_examples(args, tokenizer, labels, pad_token_label_id, mode):
     all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
     all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
     all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
-    all_label_ids = torch.tensor([f.label_ids for f in features], dtype=torch.long)
+    all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.long)
 
     dataset = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
     return dataset
@@ -318,7 +315,8 @@ def main():
                         help="Path to pre-trained model or shortcut name selected in the list: " + ", ".join(ALL_MODELS))
     parser.add_argument("--output_dir", default=None, type=str, required=True,
                         help="The output directory where the model predictions and checkpoints will be written.")
-
+    parser.add_argument("--task_name", default='weibo', type=str,
+                        help="Dataset")
     ## Other parameters
     parser.add_argument("--labels", default="", type=str,
                         help="Path to a file containing all labels. If not specified, CoNLL-2003 labels are used.")
@@ -377,6 +375,10 @@ def main():
                         help="Overwrite the cached training and evaluation sets")
     parser.add_argument("--seed", type=int, default=42,
                         help="random seed for initialization")
+    parser.add_argument("--save_loss", action="store_true",
+                        help="dump loss")
+    parser.add_argument("--loss_dir", type=str, default='output-loss/',
+                        help="dump loss")                       
 
     parser.add_argument("--fp16", action="store_true",
                         help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit")
@@ -414,6 +416,8 @@ def main():
         args.n_gpu = 1
     args.device = device
 
+    acc_loss=[]
+
     # Setup logging
     logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
                         datefmt="%m/%d/%Y %H:%M:%S",
@@ -425,7 +429,7 @@ def main():
     set_seed(args)
 
     # Prepare CONLL-2003 task
-    labels = get_labels(args.labels)
+    labels = processors[args.task_name]().get_labels()
     num_labels = len(labels)
     # Use cross entropy ignore index as padding label id so that only real label ids contribute to the loss later
     pad_token_label_id = CrossEntropyLoss().ignore_index
@@ -457,7 +461,7 @@ def main():
     # Training
     if args.do_train:
         train_dataset = load_and_cache_examples(args, tokenizer, labels, pad_token_label_id, mode="train")
-        global_step, tr_loss = train(args, train_dataset, model, tokenizer, labels, pad_token_label_id)
+        global_step, tr_loss = train(args, train_dataset, model, tokenizer, labels, pad_token_label_id, acc_loss)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Saving best-practices: if you use defaults names for the model, you can reload it using from_pretrained()
@@ -475,7 +479,10 @@ def main():
 
         # Good practice: save your training arguments together with the trained model
         torch.save(args, os.path.join(args.output_dir, "training_args.bin"))
-
+    
+    if args.save_loss:
+        with open(os.path.join(args.loss_dir, str(args.learning_rate)), 'wb') as fp:
+            pickle.dump(acc_loss, fp)
     # Evaluation
     results = {}
     if args.do_eval and args.local_rank in [-1, 0]:

@@ -31,7 +31,7 @@ import random
 import numpy as np 
 from tqdm import tqdm 
 
-from glyce.dataset_readers.bert_data_utils import * 
+from bert_data_utils import * 
 
 
 
@@ -142,3 +142,9 @@ class ResumeNERProcessor(DataProcessor):
             guid = "{}_{}".format("resume.ner", str(i))
             examples.append(InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
         return examples 
+
+ner_processors={
+    "resume": ResumeNERProcessor, 
+    "msra": MsraNERProcessor,
+    "ontonotes": OntoNotesNERProcessor
+}
